@@ -95,12 +95,12 @@ class MainWindow(QMainWindow):
         self.select_btn.clicked.connect(self.select_folder)
         control_layout.addWidget(self.select_btn)
 
-        control_layout.addWidget(QLabel("Пара:"))
-        self.pair_combo = QComboBox()
-        self.pair_combo.setEnabled(False)
-        self.pair_combo.setMinimumWidth(400)
-        self.pair_combo.currentIndexChanged.connect(self.on_pair_selected)
-        control_layout.addWidget(self.pair_combo)
+        control_layout.addWidget(QLabel("Файл:"))
+        self.file_combo = QComboBox()
+        self.file_combo.setEnabled(False)
+        self.file_combo.setMinimumWidth(400)
+        self.file_combo.currentIndexChanged.connect(self.on_file_selected)
+        control_layout.addWidget(self.file_combo)
 
         control_layout.addStretch()
         main_layout.addLayout(control_layout)
@@ -127,30 +127,43 @@ class MainWindow(QMainWindow):
 
         self.canvas_amplitude.mpl_connect('button_press_event', self.on_amplitude_click)
 
-        self.pairs = []
+        # Текущие данные
         self.current_signal_x = None
         self.current_signal_y = None
         self.current_amplitude_x = None
         self.current_amplitude_y = None
-        self.current_amplitude_y_raw = None
+        self.current_has_signal = False
+        self.current_has_amplitude = False
         self.current_sig_type = None
 
+        # Аннотации
         self.current_vline = None
         self.current_hline = None
         self.current_point = None
 
-    def extract_key_and_type(self, filename):
+    def extract_info(self, filename):
+        """Возвращает (тип, ключ, является_ли_файл_амплитудой)"""
         basename = os.path.basename(filename)
-        for prefix in ['EPSP-', 'PS-']:
-            if basename.startswith(prefix):
-                sig_type = prefix[:-1]
-                rest = basename[len(prefix):]
-                if '_' in rest:
-                    key = rest.split('_')[0]
-                else:
-                    key = rest
-                return sig_type, key
-        return None, None
+        if basename.startswith('AmplitudeEPSP-'):
+            sig_type = 'EPSP'
+            key = basename[len('AmplitudeEPSP-'):]
+            is_amp = True
+        elif basename.startswith('AmplitudePS-'):
+            sig_type = 'PS'
+            key = basename[len('AmplitudePS-'):]
+            is_amp = True
+        elif basename.startswith('EPSP-'):
+            sig_type = 'EPSP'
+            key = basename[len('EPSP-'):]
+            is_amp = False
+        elif basename.startswith('PS-'):
+            sig_type = 'PS'
+            key = basename[len('PS-'):]
+            is_amp = False
+        else:
+            return None, None, None
+        key = os.path.splitext(key)[0]  # убираем расширение
+        return sig_type, key, is_amp
 
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Выберите папку с файлами")
@@ -159,111 +172,190 @@ class MainWindow(QMainWindow):
         self.scan_folder(folder)
 
     def scan_folder(self, folder):
-        signal_patterns = [os.path.join(folder, "EPSP-*"), os.path.join(folder, "PS-*")]
-        signal_files = []
-        for pattern in signal_patterns:
-            signal_files.extend(glob.glob(pattern))
+        patterns = ['EPSP-*', 'PS-*', 'AmplitudeEPSP-*', 'AmplitudePS-*']
+        all_files = []
+        for pattern in patterns:
+            all_files.extend(glob.glob(os.path.join(folder, pattern)))
 
-        if not signal_files:
+        if not all_files:
             QMessageBox.warning(self, "Предупреждение",
-                                "Не найдено файлов, начинающихся с EPSP- или PS-")
-            self.pair_combo.clear()
-            self.pair_combo.setEnabled(False)
+                                "Не найдено файлов, начинающихся с EPSP-, PS-, AmplitudeEPSP- или AmplitudePS-")
+            self.file_combo.clear()
+            self.file_combo.setEnabled(False)
             return
 
-        pairs = []
-        for sig_path in signal_files:
-            sig_type, key = self.extract_key_and_type(sig_path)
-            if not sig_type or not key:
+        all_files.sort()
+
+        self.file_combo.clear()
+        for f in all_files:
+            sig_type, key, is_amp = self.extract_info(f)
+            if sig_type is None:
                 continue
-            amp_prefix = f"Amplitude{sig_type}-{key}"
-            amp_pattern = os.path.join(folder, amp_prefix + "*")
-            amp_files = glob.glob(amp_pattern)
-            if amp_files:
-                amp_path = amp_files[0]
-                pairs.append((sig_type, key, sig_path, amp_path))
+            if is_amp:
+                label = f"[A] {sig_type}: {key}"
+            else:
+                label = f"[S] {sig_type}: {key}"
+            self.file_combo.addItem(label, userData=f)
+        self.file_combo.setEnabled(True)
 
-        if not pairs:
-            QMessageBox.warning(self, "Предупреждение",
-                                "Не найдено парных Amplitude-файлов")
-            self.pair_combo.clear()
-            self.pair_combo.setEnabled(False)
+        if all_files:
+            self.on_file_selected(0)
+
+    def on_file_selected(self, index):
+        if index < 0:
+            return
+        file_path = self.file_combo.itemData(index)
+        if not file_path:
+            return
+        self.plot_file(file_path)
+
+    def plot_file(self, file_path):
+        sig_type, key, is_amp = self.extract_info(file_path)
+        if sig_type is None:
+            QMessageBox.warning(self, "Ошибка", "Некорректное имя файла")
             return
 
-        pairs.sort(key=lambda x: (x[0], x[1]))
-        self.pairs = pairs
-
-        self.pair_combo.clear()
-        for sig_type, key, _, _ in pairs:
-            self.pair_combo.addItem(f"{sig_type}: {key}")
-        self.pair_combo.setEnabled(True)
-
-        if pairs:
-            self.plot_pair(0)
-
-    def on_pair_selected(self, index):
-        if index >= 0:
-            self.plot_pair(index)
-
-    def plot_pair(self, index):
-        if index < 0 or index >= len(self.pairs):
-            return
-
-        sig_type, key, sig_path, amp_path = self.pairs[index]
         self.current_sig_type = sig_type
+        folder = os.path.dirname(file_path)
 
         try:
-            df_sig = pd.read_csv(sig_path, sep=None, engine='python')
-            df_amp = pd.read_csv(amp_path, sep=None, engine='python')
+            if is_amp:
+                # Только амплитуда
+                self.current_has_signal = False
+                self.current_has_amplitude = True
+                self.plot_amplitude_only(file_path, sig_type, key)
+            else:
+                # Сигнальный файл
+                self.current_has_signal = True
+                self.current_has_amplitude = False
 
-            xcol_sig = df_sig.columns[0]
-            ycol_sig = df_sig.columns[1] if len(df_sig.columns) > 1 else xcol_sig
-            xcol_amp = df_amp.columns[0]
-            ycol_amp = df_amp.columns[1] if len(df_amp.columns) > 1 else xcol_amp
+                # Ищем парный Amplitude-файл
+                amp_basename = f"Amplitude{sig_type}-{key}.csv"
+                amp_candidates = [amp_basename, amp_basename.replace('.csv', '') + '.*']
+                amp_path = None
+                for candidate in amp_candidates:
+                    full_candidate = os.path.join(folder, candidate)
+                    matches = glob.glob(full_candidate)
+                    if matches:
+                        amp_path = matches[0]
+                        break
+                if amp_path is None:
+                    amp_basename = f"Amplitude{sig_type}-{key}"
+                    full_candidate = os.path.join(folder, amp_basename + ".*")
+                    matches = glob.glob(full_candidate)
+                    if matches:
+                        amp_path = matches[0]
 
-            raw_amp = df_amp[ycol_amp].values
-            amp_y_values = raw_amp * -1
-
-            self.current_signal_x = df_sig[xcol_sig].values
-            self.current_signal_y = df_sig[ycol_sig].values
-            self.current_amplitude_x = df_amp[xcol_amp].values
-            self.current_amplitude_y = amp_y_values
-            self.current_amplitude_y_raw = raw_amp
-
-            x_sig, y_sig = insert_nan_at_gaps(self.current_signal_x, self.current_signal_y)
-            x_amp, y_amp = insert_nan_at_gaps(self.current_amplitude_x, self.current_amplitude_y)
-
-            self.canvas_signal.ax.clear()
-            self.canvas_signal.ax.plot(x_sig, y_sig, color='b', linewidth=1.5, label=sig_type)
-            self.canvas_signal.ax.set_title(f"{sig_type}: {key}")
-            self.canvas_signal.ax.set_xlabel("Время (мс)")
-            self.canvas_signal.ax.set_ylabel(f"{sig_type} (мВ)")
-            self.canvas_signal.ax.grid(True, linestyle='--', alpha=0.7)
-            self.canvas_signal.ax.legend()
-            self.canvas_signal.fig.tight_layout()
-            self.canvas_signal.draw()
-            self.canvas_signal.set_original_limits()
-
-            self.canvas_amplitude.ax.clear()
-            self.canvas_amplitude.ax.scatter(x_amp, y_amp, color='r', s=10, alpha=0.8,
-                                              label=f"Amplitude {sig_type}")
-            self.canvas_amplitude.ax.set_title(f"Amplitude {sig_type}: {key}")
-            self.canvas_amplitude.ax.set_xlabel("Время (мс)")
-            self.canvas_amplitude.ax.set_ylabel(f"Амплитуда {sig_type} (мВ)")
-            self.canvas_amplitude.ax.grid(True, linestyle='--', alpha=0.7)
-            self.canvas_amplitude.ax.legend()
-            self.canvas_amplitude.fig.tight_layout()
-            self.canvas_amplitude.draw()
-            self.canvas_amplitude.set_original_limits()
-
-            self.current_vline = None
-            self.current_hline = None
-            self.current_point = None
+                self.current_has_amplitude = (amp_path is not None)
+                self.plot_signal_and_amplitude(file_path, amp_path, sig_type, key)
 
         except Exception as e:
             QMessageBox.critical(self, "Ошибка", f"Не удалось построить график:\n{str(e)}")
 
+    def plot_signal_and_amplitude(self, sig_path, amp_path, sig_type, key):
+        # Сигнал
+        df_sig = pd.read_csv(sig_path, sep=None, engine='python')
+        xcol_sig = df_sig.columns[0]
+        ycol_sig = df_sig.columns[1] if len(df_sig.columns) > 1 else xcol_sig
+        self.current_signal_x = df_sig[xcol_sig].values
+        self.current_signal_y = df_sig[ycol_sig].values
+        x_sig, y_sig = insert_nan_at_gaps(self.current_signal_x, self.current_signal_y)
+
+        self.canvas_signal.ax.clear()
+        self.canvas_signal.ax.plot(x_sig, y_sig, color='b', linewidth=1.5, label=sig_type)
+        self.canvas_signal.ax.set_title(f"{sig_type}: {key}")
+        self.canvas_signal.ax.set_xlabel("Время (мс)")
+        self.canvas_signal.ax.set_ylabel(f"{sig_type} (мВ)")
+        self.canvas_signal.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas_signal.ax.legend()
+        self.canvas_signal.fig.tight_layout()
+        self.canvas_signal.draw()
+        self.canvas_signal.set_original_limits()
+
+        # Амплитуда
+        self.canvas_amplitude.ax.clear()
+        if amp_path is not None:
+            df_amp = pd.read_csv(amp_path, sep=None, engine='python')
+            xcol_amp = df_amp.columns[0]
+            ycol_amp = df_amp.columns[1] if len(df_amp.columns) > 1 else xcol_amp
+            amp_values = df_amp[ycol_amp].values  # уже положительные
+            self.current_amplitude_x = df_amp[xcol_amp].values
+            self.current_amplitude_y = amp_values
+
+            x_amp, y_amp = insert_nan_at_gaps(self.current_amplitude_x, self.current_amplitude_y)
+
+            self.canvas_amplitude.ax.scatter(x_amp, y_amp, color='r', s=10, alpha=0.8,
+                                              label=f"Amplitude {sig_type}")
+            self.canvas_amplitude.ax.set_title(f"Amplitude {sig_type}: {key}")
+            self.canvas_amplitude.ax.set_ylabel(f"Амплитуда {sig_type} (мВ)")
+            self.canvas_amplitude.ax.legend()
+            self.canvas_amplitude.setEnabled(True)
+        else:
+            self.canvas_amplitude.ax.text(0.5, 0.5, "Нет файла амплитуды",
+                                          transform=self.canvas_amplitude.ax.transAxes,
+                                          ha='center', va='center', fontsize=12)
+            self.canvas_amplitude.ax.set_title("Amplitude отсутствует")
+            self.canvas_amplitude.setEnabled(False)
+        self.canvas_amplitude.ax.set_xlabel("Время (мс)")
+        self.canvas_amplitude.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas_amplitude.fig.tight_layout()
+        self.canvas_amplitude.draw()
+        self.canvas_amplitude.set_original_limits()
+
+        # Сброс аннотаций
+        self.current_vline = None
+        self.current_hline = None
+        self.current_point = None
+
+    def plot_amplitude_only(self, amp_path, sig_type, key):
+        # Только амплитуда (без сигнала)
+        df_amp = pd.read_csv(amp_path, sep=None, engine='python')
+        xcol_amp = df_amp.columns[0]
+        ycol_amp = df_amp.columns[1] if len(df_amp.columns) > 1 else xcol_amp
+        amp_values = df_amp[ycol_amp].values
+        self.current_amplitude_x = df_amp[xcol_amp].values
+        self.current_amplitude_y = amp_values
+        self.current_has_amplitude = True
+
+        x_amp, y_amp = insert_nan_at_gaps(self.current_amplitude_x, self.current_amplitude_y)
+
+        # Верхний график: нет сигнала
+        self.canvas_signal.ax.clear()
+        self.canvas_signal.ax.text(0.5, 0.5, "Нет файла сигнала",
+                                   transform=self.canvas_signal.ax.transAxes,
+                                   ha='center', va='center', fontsize=12)
+        self.canvas_signal.ax.set_title(f"Сигнал отсутствует (Amplitude {sig_type}: {key})")
+        self.canvas_signal.ax.set_xlabel("Время (мс)")
+        self.canvas_signal.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas_signal.fig.tight_layout()
+        self.canvas_signal.draw()
+        self.canvas_signal.set_original_limits()
+
+        # Нижний график: амплитуды
+        self.canvas_amplitude.ax.clear()
+        self.canvas_amplitude.ax.scatter(x_amp, y_amp, color='r', s=10, alpha=0.8,
+                                          label=f"Amplitude {sig_type}")
+        self.canvas_amplitude.ax.set_title(f"Amplitude {sig_type}: {key}")
+        self.canvas_amplitude.ax.set_xlabel("Время (мс)")
+        self.canvas_amplitude.ax.set_ylabel(f"Амплитуда {sig_type} (мВ)")
+        self.canvas_amplitude.ax.legend()
+        self.canvas_amplitude.ax.grid(True, linestyle='--', alpha=0.7)
+        self.canvas_amplitude.fig.tight_layout()
+        self.canvas_amplitude.draw()
+        self.canvas_amplitude.set_original_limits()
+        self.canvas_amplitude.setEnabled(False)  # клик неактивен
+
+        self.current_signal_x = None
+        self.current_signal_y = None
+        self.current_has_signal = False
+
+        self.current_vline = None
+        self.current_hline = None
+        self.current_point = None
+
     def find_continuous_segment(self, t, threshold_factor=10):
+        if not self.current_has_signal:
+            return False, 0
         x = self.current_signal_x
         if len(x) < 2:
             return False, 0
@@ -285,6 +377,8 @@ class MainWindow(QMainWindow):
         return is_continuous, idx_closest
 
     def on_amplitude_click(self, event):
+        if not self.current_has_signal or not self.current_has_amplitude:
+            return
         if event.inaxes != self.canvas_amplitude.ax:
             return
         if event.xdata is None:
@@ -293,14 +387,13 @@ class MainWindow(QMainWindow):
 
         idx_amp = np.argmin(np.abs(self.current_amplitude_x - t_click))
         t_amp = self.current_amplitude_x[idx_amp]
-        raw_amp = self.current_amplitude_y_raw[idx_amp]
+        amp_value = self.current_amplitude_y[idx_amp]  # положительная амплитуда
 
         is_cont, idx_closest = self.find_continuous_segment(t_amp)
         if not is_cont:
             t_amp = self.current_signal_x[idx_closest]
-            print(f"Коррекция: время смещено к {t_amp:.2f} мс (разрыв)")
 
-        half_window = 50.0
+        half_window = DEFAULT_PEAK_WINDOW
         left = t_amp - half_window
         right = t_amp + half_window
 
@@ -337,8 +430,8 @@ class MainWindow(QMainWindow):
             label=f'пик при t={t_amp:.2f} мс'
         )
         self.current_hline = self.canvas_signal.ax.axhline(
-            y=raw_amp, color='green', linestyle=':', linewidth=1, alpha=0.7,
-            label=f'амплитуда = {raw_amp:.2f} мВ'
+            y=amp_value, color='green', linestyle=':', linewidth=1, alpha=0.7,
+            label=f'амплитуда = {amp_value:.2f} мВ'
         )
         y_interp = np.interp(t_amp, self.current_signal_x, self.current_signal_y)
         self.current_point = self.canvas_signal.ax.plot(
